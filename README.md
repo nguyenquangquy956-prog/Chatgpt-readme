@@ -1687,3 +1687,85 @@ unzip -p "$HOME/Downloads/iPhone14,8_27.2_24B119_Restore.ipsw" BuildManifest.pli
 ipsw kernel version "$B"
 sha256sum "$B"
 ```
+
+# 33. Differential iOS 27.2 → 27.2.1 — kernelcache (2026-11-15)
+
+## 33.1 Định danh artifact
+
+| Artifact | Xác minh |
+|---|---|
+| iOS 27.2.1 IPSW | `iPhone14,8_27.2.1_24B156_Restore.ipsw` |
+| `BuildManifest.plist` | `ProductVersion=27.2.1`, `ProductBuildVersion=24B156`, `iPhone14,8` |
+| Kernel banner | `Darwin Kernel Version 27.2.0`, `xnu-13432.42.3~28/RELEASE_ARM64_T8110` |
+| Kernelcache 27.2 (`24B119`) SHA-256 | `c81fb9d291cb4e0d8cca512724079da21bc3d6460d37d6f3a4831116af8b410a` |
+| Kernelcache 27.2.1 (`24B156`) SHA-256 | `3bdfeb700abb35393b185234acc5ee95b153be8c5cbc2f55fcc01dd7f83a9b6b` |
+| Mach-O `__TEXT_EXEC` của hai kernelcache | Cùng VA/size; SHA-256 nội dung `ab514189f616f4a7` ở phép so sánh trước đó; byte-for-byte identical |
+
+## 33.2 Kết quả raw segment diff
+
+Hai kernelcache đều là Mach-O 64-bit có 9 segment. Đối chiếu segment theo tên, VA và file size cho kết quả:
+
+| Segment | Kết quả |
+|---|---|
+| `__TEXT_EXEC` (`0x2924000`) | Không byte nào đổi |
+| `__DATA`, `__DATA_CONST`, `__DATA_SPTM`, `__TEXT_BOOT_EXEC`, `__LINKEDIT` | Không đổi |
+| `__TEXT` | 16 byte đổi tại file offset `0x28–0x37`; vùng này thuộc header/metadata, không phải executable section |
+| `__PRELINK_TEXT` | 108 byte đổi, thành 15 vùng nhỏ; hai cụm chính ở file offset `0x41c848` và `0x758468` |
+| `__PRELINK_INFO` | 1,703 byte đổi ở 106 vùng; đây là vùng metadata prelink, không phải mã lệnh |
+
+Tại cụm `__PRELINK_TEXT` gần `0x41fb...`, byte giải mã thành source/build path của AppleFSCompression (`compressorKext.c`, `ChunkCompression.cpp`) và UUID/path trong build directory. Các vùng còn lại cũng khớp cấu trúc metadata/UUID trong blob đã kiểm tra. Không có bằng chứng từ raw diff rằng kernel executable đã được sửa trong 27.2.1.
+
+## 33.3 KEXT đối chiếu
+
+`ipsw kernel kexts -j` liệt kê 267 KEXT cho mỗi build. Có 17 entry đổi `platform_build`/`sdk_build` từ `24B112` sang `24B151`; bundle ID và version không đổi. Đã trích KEXT có metadata thay đổi để so section, không chỉ dựa vào timestamp:
+
+- `com.apple.kec.Compression`: toàn bộ section hash giống nhau, gồm `__TEXT_EXEC,__text` (`0x3d80` byte) và `__TEXT_EXEC,__auth_stubs`; khác biệt ở Mach-O/container metadata.
+- `com.apple.AppleFSCompression.AppleFSCompressionTypeZlib`: `__TEXT_EXEC,__text` (`0x8d88` byte), stubs, data và constant sections giống nhau. Chỉ `__TEXT,__cstring` khác; phần string khác là UUID và đường dẫn build tạm trong `/Library/Caches/com.apple.xbs/...`, còn thông báo/error strings giữ nguyên.
+- Các KEXT đã đối chiếu khác trong nhóm 17 (AppleActuatorDriver, display/multitouch/top-case, DiskImages và IOMobileGraphicsFamily) có hash file trích xuất giống hệt giữa hai build. `AppleTopCaseDriverV2` là metadata entry nhưng ID không được `ipsw kernel extract` phân giải thành bundle ID hợp lệ; không tính nó là đã kiểm tra binary.
+
+**[CONFIRMED, SCOPE: MAIN KERNELCACHE]** Callback/gate code đã nghiên cứu ở mục 28–32 không bị sửa trong `24B156`: toàn bộ `__TEXT_EXEC` kernel giống `24B119`, và các vùng executable của KEXT được trích ở trên cũng không đổi.
+
+**[NOT PROVEN]** Kết quả này không chứng minh toàn bộ iOS 27.2.1 không có bản vá. Các advisory 27.2.1 chủ yếu chỉ ra framework/daemon ở userspace; dyld shared cache của build `24B156` chưa trích xuất đầy đủ để làm binary diff. Không được suy từ kernelcache giống nhau sang “iOS không có patch”.
+
+## 33.4 Đối chiếu advisory Apple 27.2.1
+
+Apple ghi ngày phát hành 9 Nov 2026 và công bố các mục sau: AirPlay (bypass rate limit mã ghép đôi), App Intents (authorization), Bluetooth (use-after-free), brotli (out-of-bounds write), CoreUtils (pairing/authentication), Messages (authorization/history), rapportd (rate limit). Các CVE được advisory nêu gồm `CVE-2026-113968`, `-113963`, `-113970`, `CVE-2026-111497`, `-113965`, `-113964`, `-113961`, `-113960`, `-113969`.
+
+Nguồn chính: [Apple — security content of iOS 27.2.1](https://support.apple.com/en-asia/149715). Đây là mô tả phạm vi bản vá do vendor công bố, không phải root-cause analysis. Phân loại ưu tiên cho bước dyld diff:
+
+1. **Logic/state và pairing:** AirPlay, CoreUtils, rapportd. Tìm thay đổi trong state transitions, retry/rate-limit counters, xác thực pairing và caller authorization.
+2. **Authorization/data access:** App Intents và Messages. Đối chiếu kiểm tra quyền, thành viên hội thoại, thời điểm gia nhập và phạm vi dữ liệu trả về.
+3. **Memory safety/parser:** Bluetooth UAF và brotli OOB write. Theo dõi lifetime/ownership và giới hạn kích thước/index của parser.
+
+Chưa gán CVE nào trong advisory cho kernelcache hoặc các KEXT đối chiếu được. Thành phần cần kiểm tra kế tiếp là dyld cache 27.2 (`24B119`) so với 27.2.1 (`24B156`), đặc biệt framework/daemon tương ứng ba nhóm trên.
+
+## 33.5 Làm rõ CVE-2025-53773
+
+`CVE-2025-53773` không phải CVE của Apple/iOS. Đây là lỗ hổng command injection trong GitHub Copilot và Visual Studio, do Microsoft công bố; phạm vi affected được ghi là Visual Studio 2022 version 17.14 trước `17.14.12`. Vì vậy không dùng CVE này làm định danh hay bằng chứng cho lỗi iOS 27.0.1. Nguồn vendor: [Microsoft MSRC — CVE-2025-53773](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-53773).
+
+## 33.6 Tình trạng dyld và bước kế tiếp
+
+Đã bắt đầu giải mã dyld shared cache từ IPSW `24B156`; output hiện có mới khoảng 2.6 GB và mount APFS/extraction chưa hoàn tất. Đây chưa phải cache đầy đủ nên chưa thể chạy so sánh chính xác framework/daemon. Không lấy thiếu file làm kết luận “không đổi”. Khi hoàn tất, xác nhận đủ cache map + mọi shard, trích riêng binary theo nhóm ở mục 33.4, rồi so Mach-O section/executable bytes và disassembly quanh function đã đổi.
+
+## 33.7 Commands tái lập
+
+```bash
+K27="$HOME/ios27-diff/27.2/24B119__iPhone14,8/kernelcache.release.iPhone14,8"
+K2721="$HOME/ios27-diff/27.2.1/24B156__iPhone14,8/24B156__iPhone14,8/kernelcache.release.iPhone14,8"
+
+ipsw kernel version "$K2721"
+ipsw kernel kexts -j "$K27" > /tmp/kext27_2.json
+ipsw kernel kexts -j "$K2721" > /tmp/kext27_2_1.json
+ipsw kernel extract "$K27" com.apple.kec.Compression -o /tmp/kext-diff-27/27.2
+ipsw kernel extract "$K2721" com.apple.kec.Compression -o /tmp/kext-diff-27/27.2.1
+ipsw kernel extract "$K27" com.apple.AppleFSCompression.AppleFSCompressionTypeZlib -o /tmp/kext-diff-27/27.2
+ipsw kernel extract "$K2721" com.apple.AppleFSCompression.AppleFSCompressionTypeZlib -o /tmp/kext-diff-27/27.2.1
+sha256sum "$K27" "$K2721"
+```
+
+## 33.8 Change log — README 8
+
+1. Giữ nguyên README 7 và append kết quả binary diff 27.2 → 27.2.1.
+2. Xác minh product/build, kernel banner, segment diff và KEXT section hashes.
+3. Giới hạn kết luận vào kernelcache; ghi rõ dyld cache chưa đầy đủ.
+4. Thêm advisory map cho patch ưu tiên ở userspace và xác nhận `CVE-2025-53773` thuộc Microsoft/Visual Studio, không thuộc iOS.
